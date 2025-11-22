@@ -1,0 +1,16 @@
+services:
+- type: web
+name: points-tracker-api
+env: python
+repo: YOUR_GITHUB_REPO_URL # To be filled after GitHub setup
+region: oregon # Choose a region close to you, e.g., 'ohio' or 'oregon'
+buildCommand: "pip install -r requirements.txt"
+startCommand: "gunicorn server:app"
+envVars:
+# Render Environment Variables (CRITICAL)
+- key: MONGO_URI
+sync: false # Do not sync with repo, set securely in Render dashboard
+- key: GMAIL_SENDER
+sync: false
+- key: GMAIL_APP_PASSWORD
+sync: false

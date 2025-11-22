@@ -1,0 +1,6 @@
+Flask
+Flask-CORS
+pymongo
+python-dotenv
+cryptography
+gunicorn
