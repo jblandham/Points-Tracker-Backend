@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 # --- Fix for SSL/TLS Handshake Errors ---
 import ssl
+
 # Removed TLS_CONTEXT = ssl.create_default_context() as it's no longer needed in the simplified client
 # ----------------------------------------
 
@@ -31,7 +32,7 @@ try:
     CLIENT = MongoClient(
         MONGO_URI,
         serverSelectionTimeoutMS=5000,
-        tls=True, # Enable TLS/SSL (standard and sufficient for Render)
+        tls=True,  # Enable TLS/SSL (standard and sufficient for Render)
     )
     DB = CLIENT.points_tracker_db
     STATE_COLLECTION = DB.app_state
@@ -62,11 +63,12 @@ DEFAULT_STATE = {
     "scores": {"Lila": 0, "Maryn": 0},
     "currentPin": DEFAULT_PIN,
     "adminPassHash": DEFAULT_ADMIN_PASSWORD_HASH,
-    "notifications": [ {"phone": "", "carrier": ""}] * 5,
+    "notifications": [{"phone": "", "carrier": ""}] * 5,
     "changeHistory": {"Lila": [], "Maryn": []},
     "pinThreshold": DEFAULT_THRESHOLD,
     "lastUpdated": datetime.now(timezone.utc).isoformat()
 }
+
 
 def get_state():
     state = STATE_COLLECTION.find_one()
@@ -77,15 +79,19 @@ def get_state():
         STATE_COLLECTION.insert_one(DEFAULT_STATE)
         return DEFAULT_STATE.copy()
 
+
 def update_state(data):
     if '_id' in data:
         del data['_id']
     data['lastUpdated'] = datetime.now(timezone.utc).isoformat()
     STATE_COLLECTION.replace_one({}, data, upsert=True)
 
+
 def send_email_notification(message_subject, notifications):
     if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
+        print("EMAIL LOG: Credentials missing.")
         return
+
     recipients = []
     for n in notifications:
         phone = n.get('phone')
@@ -96,29 +102,38 @@ def send_email_notification(message_subject, notifications):
             if len(phone) == 10:
                 recipients.append(f"{phone}@{domain}")
     if not recipients:
+        print("EMAIL LOG: No valid recipients.")
         return
+
     msg = EmailMessage()
     msg['Subject'] = "Points Tracker Alert"
     msg['From'] = GMAIL_SENDER
     msg['To'] = ", ".join(recipients)
     msg.set_content(message_subject)
+
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.ehlo()
+        # CRITICAL FIX: Switched to Port 587 (STARTTLS) and added timeout
+        print("EMAIL LOG: Connecting to SMTP server...")
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
+            server.set_debuglevel(1)  # Enable debug output to see handshake in logs
+            server.starttls()  # Upgrade connection to secure
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
         print(f"EMAIL SUCCESS: Sent to {len(recipients)} recipients.")
     except Exception as e:
         print(f"EMAIL ERROR: {e}")
 
+
 @app.route('/')
 def api_root():
     return jsonify({"status": "Server running", "service": "Points Tracker API"}), 200
+
 
 @app.route('/api/state', methods=['GET'])
 def api_get_state():
     state = get_state()
     return jsonify(state)
+
 
 @app.route('/api/state', methods=['POST'])
 def api_update_state():
@@ -128,6 +143,7 @@ def api_update_state():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/api/state/send-alert', methods=['POST'])
 def api_notify():
     try:
@@ -135,11 +151,16 @@ def api_notify():
         message_body = data.get('notificationMessage')
         notifications = data.get('notifications', [])
         if not message_body or not notifications:
-             return jsonify({"error": "Missing data."}), 400
+            return jsonify({"error": "Missing data."}), 400
+
+        # Note: This is still a blocking call. If SMTP is slow, the request waits.
+        # But with the 10s timeout, it won't kill the worker.
         send_email_notification(message_body, notifications)
+
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     if 'STATE_COLLECTION' in locals():
