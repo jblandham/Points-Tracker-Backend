@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Fix for SSL/TLS Handshake Errors ---
 import ssl
-TLS_CONTEXT = ssl.create_default_context()
+# Removed TLS_CONTEXT = ssl.create_default_context() as it's no longer needed in the simplified client
 # ----------------------------------------
 
 load_dotenv()
@@ -27,19 +27,19 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 try:
+    # 1. Server initialization check
     CLIENT = MongoClient(
         MONGO_URI,
         serverSelectionTimeoutMS=5000,
-        tls=True,
-        tlsAllowInvalidCertificates=False,
-        tls_cert_reqs=ssl.CERT_REQUIRED,
-        tls_context=TLS_CONTEXT
+        tls=True, # Enable TLS/SSL (standard and sufficient for Render)
     )
     DB = CLIENT.points_tracker_db
     STATE_COLLECTION = DB.app_state
 except Exception as e:
     print(f"\n--- CRITICAL MongoDB Initialization Failure ---\nError: {e}\n")
     exit(1)
+
+# ... (rest of the server.py code remains the same)
 
 app = Flask(__name__)
 CORS(app)
@@ -111,9 +111,14 @@ def send_email_notification(message_subject, notifications):
     except Exception as e:
         print(f"EMAIL ERROR: {e}")
 
+@app.route('/')
+def api_root():
+    return jsonify({"status": "Server running", "service": "Points Tracker API"}), 200
+
 @app.route('/api/state', methods=['GET'])
 def api_get_state():
-    return jsonify(get_state())
+    state = get_state()
+    return jsonify(state)
 
 @app.route('/api/state', methods=['POST'])
 def api_update_state():
