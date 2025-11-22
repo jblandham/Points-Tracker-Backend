@@ -4,6 +4,7 @@
 import os
 import json
 import smtplib
+import socket  # Required for the IPv4 fix
 from email.message import EmailMessage
 from datetime import datetime, timezone
 import hashlib
@@ -14,12 +15,24 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
-# --- Fix for SSL/TLS Handshake Errors ---
-import ssl
 
-# Removed TLS_CONTEXT = ssl.create_default_context() as it's no longer needed in the simplified client
+# --- Fix for Render/Gmail IPv6 Issues ---
+# Force the application to use IPv4. Gmail's DNS often resolves to IPv6,
+# which fails on many containerized cloud environments (Error 101).
+def force_ipv4():
+    old_getaddrinfo = socket.getaddrinfo
+
+    def new_getaddrinfo(*args, **kwargs):
+        responses = old_getaddrinfo(*args, **kwargs)
+        return [response for response in responses if response[0] == socket.AF_INET]
+
+    socket.getaddrinfo = new_getaddrinfo
+
+
+force_ipv4()
 # ----------------------------------------
 
+# Load environment variables from .env file
 load_dotenv()
 
 # --- Configuration and Initialization ---
@@ -39,8 +52,6 @@ try:
 except Exception as e:
     print(f"\n--- CRITICAL MongoDB Initialization Failure ---\nError: {e}\n")
     exit(1)
-
-# ... (rest of the server.py code remains the same)
 
 app = Flask(__name__)
 CORS(app)
@@ -88,9 +99,12 @@ def update_state(data):
 
 
 def send_email_notification(message_subject, notifications):
+    """
+    Sends email. Returns True if successful, False otherwise.
+    """
     if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
         print("EMAIL LOG: Credentials missing.")
-        return
+        return False
 
     recipients = []
     for n in notifications:
@@ -103,7 +117,7 @@ def send_email_notification(message_subject, notifications):
                 recipients.append(f"{phone}@{domain}")
     if not recipients:
         print("EMAIL LOG: No valid recipients.")
-        return
+        return False
 
     msg = EmailMessage()
     msg['Subject'] = "Points Tracker Alert"
@@ -112,16 +126,16 @@ def send_email_notification(message_subject, notifications):
     msg.set_content(message_subject)
 
     try:
-        # CRITICAL FIX: Switched to Port 587 (STARTTLS) and added timeout
-        print("EMAIL LOG: Connecting to SMTP server...")
-        with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
-            server.set_debuglevel(1)  # Enable debug output to see handshake in logs
-            server.starttls()  # Upgrade connection to secure
+        print("EMAIL LOG: Connecting to SMTP server (IPv4)...")
+        # Using Port 465 (SSL) which is standard for Gmail
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=20) as server:
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
         print(f"EMAIL SUCCESS: Sent to {len(recipients)} recipients.")
+        return True
     except Exception as e:
         print(f"EMAIL ERROR: {e}")
+        return False
 
 
 @app.route('/')
@@ -153,11 +167,14 @@ def api_notify():
         if not message_body or not notifications:
             return jsonify({"error": "Missing data."}), 400
 
-        # Note: This is still a blocking call. If SMTP is slow, the request waits.
-        # But with the 10s timeout, it won't kill the worker.
-        send_email_notification(message_body, notifications)
+        success = send_email_notification(message_body, notifications)
 
-        return jsonify({"status": "success"})
+        if success:
+            return jsonify({"status": "success"})
+        else:
+            # Return 500 so the frontend knows the email failed
+            return jsonify({"error": "Email failed to send. Check server logs."}), 500
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
