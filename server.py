@@ -4,7 +4,8 @@
 import os
 import json
 import smtplib
-import socket  # Required for the IPv4 fix
+import socket
+import threading  # NEW: For non-blocking email sending
 from email.message import EmailMessage
 from datetime import datetime, timezone
 import hashlib
@@ -15,10 +16,11 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
+import ssl
 
-# --- Fix for Render/Gmail IPv6 Issues ---
-# Force the application to use IPv4. Gmail's DNS often resolves to IPv6,
-# which fails on many containerized cloud environments (Error 101).
+
+# --- IPv4 Force Patch ---
+# Crucial for Render/Cloud hosting to prevent IPv6 routing errors with Gmail
 def force_ipv4():
     old_getaddrinfo = socket.getaddrinfo
 
@@ -30,22 +32,20 @@ def force_ipv4():
 
 
 force_ipv4()
-# ----------------------------------------
 
-# Load environment variables from .env file
 load_dotenv()
 
-# --- Configuration and Initialization ---
+# --- Configuration ---
 MONGO_URI = os.getenv("MONGO_URI")
 GMAIL_SENDER = os.getenv("GMAIL_SENDER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 try:
-    # 1. Server initialization check
     CLIENT = MongoClient(
         MONGO_URI,
         serverSelectionTimeoutMS=5000,
-        tls=True,  # Enable TLS/SSL (standard and sufficient for Render)
+        tls=True,
+        tlsAllowInvalidCertificates=False,
     )
     DB = CLIENT.points_tracker_db
     STATE_COLLECTION = DB.app_state
@@ -98,13 +98,17 @@ def update_state(data):
     STATE_COLLECTION.replace_one({}, data, upsert=True)
 
 
-def send_email_notification(message_subject, notifications):
+# --- Background Email Function ---
+
+def send_email_background(message_subject, notifications):
     """
-    Sends email. Returns True if successful, False otherwise.
+    Runs in a background thread to avoid blocking the HTTP response.
     """
+    print("EMAIL JOB: Starting background email task...")
+
     if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
-        print("EMAIL LOG: Credentials missing.")
-        return False
+        print("EMAIL LOG: Credentials missing. Aborting.")
+        return
 
     recipients = []
     for n in notifications:
@@ -115,45 +119,50 @@ def send_email_notification(message_subject, notifications):
             phone = "".join(filter(str.isdigit, str(phone)))
             if len(phone) == 10:
                 recipients.append(f"{phone}@{domain}")
+
     if not recipients:
-        print("EMAIL LOG: No valid recipients.")
-        return False
+        print("EMAIL LOG: No valid recipients found.")
+        return
 
     msg = EmailMessage()
-    msg['Subject'] = "Points Tracker Alert"
+    msg['Subject'] = "Points Alert"
     msg['From'] = GMAIL_SENDER
     msg['To'] = ", ".join(recipients)
     msg.set_content(message_subject)
 
     try:
-        print("EMAIL LOG: Connecting to SMTP server (IPv4)...")
-        # Using Port 465 (SSL) which is standard for Gmail
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=20) as server:
+        # Using Port 465 (Implicit SSL) is often more robust on cloud networks than STARTTLS
+        print(f"EMAIL LOG: Connecting to smtp.gmail.com:465 for {len(recipients)} recipients...")
+
+        # Create a specific SSL context
+        context = ssl.create_default_context()
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context, timeout=15) as server:
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
+
         print(f"EMAIL SUCCESS: Sent to {len(recipients)} recipients.")
-        return True
     except Exception as e:
         print(f"EMAIL ERROR: {e}")
-        return False
 
+
+# --- API Routes ---
 
 @app.route('/')
 def api_root():
-    return jsonify({"status": "Server running", "service": "Points Tracker API"}), 200
+    return jsonify({"status": "Server running"}), 200
 
 
 @app.route('/api/state', methods=['GET'])
 def api_get_state():
-    state = get_state()
-    return jsonify(state)
+    return jsonify(get_state())
 
 
 @app.route('/api/state', methods=['POST'])
 def api_update_state():
     try:
         update_state(request.json)
-        return jsonify({"status": "success", "message": "State updated."})
+        return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -164,16 +173,18 @@ def api_notify():
         data = request.json
         message_body = data.get('notificationMessage')
         notifications = data.get('notifications', [])
+
         if not message_body or not notifications:
             return jsonify({"error": "Missing data."}), 400
 
-        success = send_email_notification(message_body, notifications)
+        # CRITICAL FIX: Spawn a background thread for email
+        # This allows the function to return "success" immediately to the Angular app
+        # preventing the UI from freezing while the email sends.
+        thread = threading.Thread(target=send_email_background, args=(message_body, notifications))
+        thread.daemon = True  # Ensure thread doesn't block server shutdown
+        thread.start()
 
-        if success:
-            return jsonify({"status": "success"})
-        else:
-            # Return 500 so the frontend knows the email failed
-            return jsonify({"error": "Email failed to send. Check server logs."}), 500
+        return jsonify({"status": "success", "message": "Notification queued."})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
