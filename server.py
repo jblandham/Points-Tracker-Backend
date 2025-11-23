@@ -3,28 +3,10 @@
 # -------------------------------------------------------------------------------------
 import socket
 import sys
-
-
-# --- CRITICAL FIX: Force IPv4 Globally ---
-# This must run before any other imports to ensure all libraries use IPv4.
-# Render/Gmail often fail with [Errno 101] Network is unreachable on IPv6.
-def force_ipv4():
-    old_getaddrinfo = socket.getaddrinfo
-
-    def new_getaddrinfo(*args, **kwargs):
-        responses = old_getaddrinfo(*args, **kwargs)
-        # Keep only IPv4 (AF_INET) results
-        return [r for r in responses if r[0] == socket.AF_INET]
-
-    socket.getaddrinfo = new_getaddrinfo
-
-
-force_ipv4()
-# ----------------------------------------
-
 import os
+import json
 import smtplib
-import threading
+import threading  # Required for background tasks
 from email.message import EmailMessage
 from datetime import datetime, timezone
 
@@ -35,6 +17,22 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import ssl
 
+
+# --- IPv4 Patch ---
+# We keep this since the deployment worked!
+# It helps prevent "Network is unreachable" errors.
+def force_ipv4():
+    old_getaddrinfo = socket.getaddrinfo
+
+    def new_getaddrinfo(*args, **kwargs):
+        responses = old_getaddrinfo(*args, **kwargs)
+        return [r for r in responses if r[0] == socket.AF_INET]
+
+    socket.getaddrinfo = new_getaddrinfo
+
+
+force_ipv4()
+
 load_dotenv()
 
 # --- Configuration ---
@@ -44,8 +42,12 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 # --- MongoDB Initialization ---
 try:
-    # Connect using standard settings. The IPv4 patch above applies here too.
-    CLIENT = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tls=True, tlsAllowInvalidCertificates=False)
+    CLIENT = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+        tls=True,
+        tlsAllowInvalidCertificates=False
+    )
     DB = CLIENT.points_tracker_db
     STATE_COLLECTION = DB.app_state
 except Exception as e:
@@ -66,18 +68,21 @@ CARRIER_GATEWAYS = {
     'Cricket': 'mms.aiowireless.net',
     'US Cellular': 'email.uscc.net',
 }
+DEFAULT_ADMIN_PASSWORD_HASH = 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3'
+DEFAULT_PIN = '1234'
+DEFAULT_THRESHOLD = 10
 DEFAULT_STATE = {
     "scores": {"Lila": 0, "Maryn": 0},
-    "currentPin": "1234",
-    "adminPassHash": "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3",
+    "currentPin": DEFAULT_PIN,
+    "adminPassHash": DEFAULT_ADMIN_PASSWORD_HASH,
     "notifications": [{"phone": "", "carrier": ""}] * 5,
     "changeHistory": {"Lila": [], "Maryn": []},
-    "pinThreshold": 10,
+    "pinThreshold": DEFAULT_THRESHOLD,
     "lastUpdated": datetime.now(timezone.utc).isoformat()
 }
 
 
-# --- Data Helpers ---
+# --- Helpers ---
 def get_state():
     state = STATE_COLLECTION.find_one()
     if state:
@@ -95,7 +100,10 @@ def update_state(data):
 
 # --- Email Logic (Background) ---
 def send_email_background(message_subject, notifications):
-    print("EMAIL JOB: Processing...")
+    """
+    Runs in a background thread to avoid blocking the HTTP response.
+    """
+    print("EMAIL JOB: Processing in background...")
 
     if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
         print("EMAIL LOG: Missing Credentials.")
@@ -122,20 +130,15 @@ def send_email_background(message_subject, notifications):
     msg.set_content(message_subject)
 
     try:
-        # 1. Manually resolve IP to guarantee IPv4
+        # Using Port 465 (SSL) with manual IP resolution is the most robust method
         gmail_host = 'smtp.gmail.com'
         gmail_ip = socket.gethostbyname(gmail_host)
-        print(f"EMAIL LOG: Resolved {gmail_host} to IPv4: {gmail_ip}")
+        print(f"EMAIL LOG: Connecting to {gmail_ip}:465 (SSL)...")
 
-        # 2. Connect using the resolved IP directly on Port 465 (SSL)
-        # We pass server_hostname so SSL verification still works against 'smtp.gmail.com'
         context = ssl.create_default_context()
 
-        print(f"EMAIL LOG: Connecting to {gmail_ip}:465...")
         with smtplib.SMTP_SSL(gmail_ip, 465, context=context, timeout=30) as server:
-            # Force the SNI (Server Name Indication) to match the real hostname, not the IP
-            server._host = gmail_host
-
+            server._host = gmail_host  # Set SNI
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
 
@@ -175,7 +178,7 @@ def api_notify():
         if not message_body or not notifications:
             return jsonify({"error": "Missing data."}), 400
 
-        # Start background thread
+        # CRITICAL FIX: Spawn background thread
         thread = threading.Thread(target=send_email_background, args=(message_body, notifications))
         thread.daemon = True
         thread.start()
