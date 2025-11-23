@@ -1,37 +1,19 @@
 # -------------------------------------------------------------------------------------
 # Python Flask Server for MongoDB/Email-to-Text Backend
 # -------------------------------------------------------------------------------------
-import socket
-import sys
 import os
 import json
 import smtplib
-import threading  # Required for background tasks
+import socket
+import threading
 from email.message import EmailMessage
 from datetime import datetime, timezone
 
-# Flask and MongoDB Libraries
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import ssl
-
-
-# --- IPv4 Patch ---
-# We keep this since the deployment worked!
-# It helps prevent "Network is unreachable" errors.
-def force_ipv4():
-    old_getaddrinfo = socket.getaddrinfo
-
-    def new_getaddrinfo(*args, **kwargs):
-        responses = old_getaddrinfo(*args, **kwargs)
-        return [r for r in responses if r[0] == socket.AF_INET]
-
-    socket.getaddrinfo = new_getaddrinfo
-
-
-force_ipv4()
 
 load_dotenv()
 
@@ -42,16 +24,13 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 # --- MongoDB Initialization ---
 try:
-    CLIENT = MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-        tls=True,
-        tlsAllowInvalidCertificates=False
-    )
+    CLIENT = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tls=True, tlsAllowInvalidCertificates=False)
     DB = CLIENT.points_tracker_db
     STATE_COLLECTION = DB.app_state
 except Exception as e:
     print(f"\n--- CRITICAL MongoDB Initialization Failure ---\nError: {e}\n")
+    import sys
+
     sys.exit(1)
 
 app = Flask(__name__)
@@ -82,7 +61,7 @@ DEFAULT_STATE = {
 }
 
 
-# --- Helpers ---
+# --- Data Helpers ---
 def get_state():
     state = STATE_COLLECTION.find_one()
     if state:
@@ -100,10 +79,7 @@ def update_state(data):
 
 # --- Email Logic (Background) ---
 def send_email_background(message_subject, notifications):
-    """
-    Runs in a background thread to avoid blocking the HTTP response.
-    """
-    print("EMAIL JOB: Processing in background...")
+    print("EMAIL JOB: Processing...")
 
     if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
         print("EMAIL LOG: Missing Credentials.")
@@ -130,15 +106,15 @@ def send_email_background(message_subject, notifications):
     msg.set_content(message_subject)
 
     try:
-        # Using Port 465 (SSL) with manual IP resolution is the most robust method
-        gmail_host = 'smtp.gmail.com'
-        gmail_ip = socket.gethostbyname(gmail_host)
-        print(f"EMAIL LOG: Connecting to {gmail_ip}:465 (SSL)...")
+        # RETRY: Port 587 (STARTTLS) with standard connection logic
+        # This avoids raw socket manipulation which might be flagged by firewalls
+        print("EMAIL LOG: Connecting to smtp.gmail.com:587...")
 
-        context = ssl.create_default_context()
-
-        with smtplib.SMTP_SSL(gmail_ip, 465, context=context, timeout=30) as server:
-            server._host = gmail_host  # Set SNI
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=30) as server:
+            server.set_debuglevel(0)  # Turn off debug noise to see clean errors
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
 
@@ -178,7 +154,6 @@ def api_notify():
         if not message_body or not notifications:
             return jsonify({"error": "Missing data."}), 400
 
-        # CRITICAL FIX: Spawn background thread
         thread = threading.Thread(target=send_email_background, args=(message_body, notifications))
         thread.daemon = True
         thread.start()
