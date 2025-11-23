@@ -16,42 +16,33 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
+# --- Fix for SSL/TLS Handshake Errors ---
 import ssl
 
-
-# --- IPv4 Force Patch ---
-# Crucial for Render/Cloud hosting to prevent IPv6 routing errors with Gmail
-def force_ipv4():
-    old_getaddrinfo = socket.getaddrinfo
-
-    def new_getaddrinfo(*args, **kwargs):
-        responses = old_getaddrinfo(*args, **kwargs)
-        return [response for response in responses if response[0] == socket.AF_INET]
-
-    socket.getaddrinfo = new_getaddrinfo
-
-
-force_ipv4()
+# Removed TLS_CONTEXT = ssl.create_default_context() as it's no longer needed in the simplified client
+# ----------------------------------------
 
 load_dotenv()
 
-# --- Configuration ---
+# --- Configuration and Initialization ---
 MONGO_URI = os.getenv("MONGO_URI")
 GMAIL_SENDER = os.getenv("GMAIL_SENDER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 try:
+    # 1. Server initialization check
     CLIENT = MongoClient(
         MONGO_URI,
         serverSelectionTimeoutMS=5000,
-        tls=True,
-        tlsAllowInvalidCertificates=False,
+        tls=True,  # Enable TLS/SSL (standard and sufficient for Render)
     )
     DB = CLIENT.points_tracker_db
     STATE_COLLECTION = DB.app_state
 except Exception as e:
     print(f"\n--- CRITICAL MongoDB Initialization Failure ---\nError: {e}\n")
     exit(1)
+
+# ... (rest of the server.py code remains the same)
 
 app = Flask(__name__)
 CORS(app)
@@ -131,13 +122,13 @@ def send_email_background(message_subject, notifications):
     msg.set_content(message_subject)
 
     try:
-        # Using Port 465 (Implicit SSL) is often more robust on cloud networks than STARTTLS
-        print(f"EMAIL LOG: Connecting to smtp.gmail.com:465 for {len(recipients)} recipients...")
+        # Using Port 587 (STARTTLS) is standard and often safer on cloud networks
+        print(f"EMAIL LOG: Connecting to smtp.gmail.com:587 (STARTTLS) for {len(recipients)} recipients...")
 
-        # Create a specific SSL context
-        context = ssl.create_default_context()
-
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context, timeout=15) as server:
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=20) as server:
+            server.ehlo()
+            server.starttls()  # Secure the connection
+            server.ehlo()
             server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
 
@@ -193,3 +184,4 @@ def api_notify():
 if __name__ == '__main__':
     if 'STATE_COLLECTION' in locals():
         app.run(debug=True, port=5000, host='0.0.0.0')
+        #d186ff
